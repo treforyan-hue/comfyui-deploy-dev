@@ -1,0 +1,56 @@
+# ══════════════════════════════════════════════════════════════
+# ComfyUI Ready Image — RunPod variant
+#
+# Thin overlay over jkhlk/comfyui-ready:latest. Adds our own
+# /start.sh + /post_start.sh so sshd reliably starts and ComfyUI
+# launches in parallel with install.sh model downloads.
+#
+# Why we ship our own /start.sh:
+#   The base runpod/pytorch image's /start.sh has two landmines:
+#     1. `set -e` on line 2 — any failing command kills the script.
+#     2. Inside setup_ssh() it runs `ssh-keygen -t dsa`. OpenSSH 9.8+
+#        removed DSA support → that command exits non-zero → set -e
+#        kills /start.sh BEFORE `service ssh start` runs → sshd is
+#        never started → container reports RUNNING but port 22 is
+#        unreachable (observed symptom: publicIp assigned but TCP
+#        ConnectionRefused on the mapped port).
+#   Our replacement /start.sh does the same logical flow (PUBLIC_KEY
+#   → sshd → env export → /post_start.sh → sleep infinity) but with
+#   `set +e` and WITHOUT the DSA keygen — modern key types only.
+#
+# This image is RunPod-only. The :latest tag (used by Vast.ai) is
+# unchanged — Vast has its own onstart_cmd path and never uses
+# /start.sh.
+#
+# Build via .github/workflows/build-image-runpod.yml — pushes
+# `jkhlk/comfyui-ready:runpod`.
+# ══════════════════════════════════════════════════════════════
+FROM jkhlk/comfyui-ready:latest
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Seed /opt/comfy-seed so post_start.sh can bootstrap /workspace on first boot.
+#
+# RunPod mounts /workspace as a MooseFS network volume. On the FIRST boot of
+# a brand-new pod that mount is empty and completely shadows whatever was
+# baked at /workspace/* by the base image. Without this seed, /workspace is
+# an empty FUSE dir at boot, ComfyUI can't find main.py, install.sh is gone,
+# post_start prints "WARN: install.sh missing" and the pod does nothing.
+#
+# Fix: copy the baked /workspace tree into /opt/comfy-seed (a path that is
+# NOT shadowed by any volume mount) at build time. post_start.sh rsyncs the
+# seed into /workspace on boot when main.py is missing. After the first boot
+# the seed lives on the persistent volume → second+ boots skip the rsync.
+#
+# Vast.ai (:latest tag) does NOT use this layer and is untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+RUN mkdir -p /opt/comfy-seed \
+    && cp -a /workspace/. /opt/comfy-seed/ \
+    && chmod -R a+rX /opt/comfy-seed
+
+# Custom start.sh + post_start hook
+COPY extras/start.sh /start.sh
+COPY extras/post_start.sh /post_start.sh
+RUN chmod +x /start.sh /post_start.sh
+
+# Override the upstream CMD ["python","main.py",...] with our start.sh
+CMD ["/start.sh"]

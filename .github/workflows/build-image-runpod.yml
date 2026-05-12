@@ -1,0 +1,62 @@
+name: Build ComfyUI Docker Image (RunPod variant)
+
+# Builds a thin overlay over jkhlk/comfyui-ready:latest that adds a
+# /post_start.sh hook + restores runpod-pytorch's /start.sh as CMD.
+# Pushes as `jkhlk/comfyui-ready:runpod`. The :latest tag (used by
+# Vast.ai) is NEVER touched by this workflow — it's a separate tag,
+# separate cache scope, separate image manifest.
+#
+# Triggers:
+#   1. Push to main that touches Dockerfile.runpod / extras/post_start.sh
+#      / this workflow file → rebuild only the runpod overlay.
+#   2. Successful completion of the main "Build ComfyUI Docker Image"
+#      workflow → automatically rebuild the runpod overlay so it
+#      always sits on top of the freshest :latest.
+#   3. Manual workflow_dispatch.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile.runpod'
+      - 'extras/post_start.sh'
+      - '.github/workflows/build-image-runpod.yml'
+  workflow_run:
+    workflows: ["Build ComfyUI Docker Image"]
+    types: [completed]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: jkhlk/comfyui-ready
+  IMAGE_TAG: runpod
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    # Skip if we were chained from a failed main build
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push runpod overlay
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.runpod
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          # Separate cache scope so it does NOT collide with the
+          # main :latest cache and accidentally invalidate it.
+          cache-from: type=gha,scope=runpod
+          cache-to: type=gha,mode=max,scope=runpod
