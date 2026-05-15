@@ -46,7 +46,7 @@ else
     SCRIPT_DIR="/tmp/comfyui-deploy"
     if [ ! -d "$SCRIPT_DIR" ]; then
         echo "Downloading installer..."
-        git clone --quiet --depth 1 "https://github.com/treforyan-hue/comfyui-deploy.git" "$SCRIPT_DIR" 2>/dev/null || {
+        git clone --quiet --depth 1 "https://github.com/treforyan-hue/comfyui-deploy-dev.git" "$SCRIPT_DIR" 2>/dev/null || {
             echo "ERROR: Cannot download installer. Check internet connection."
             exit 1
         }
@@ -176,10 +176,20 @@ for wf_id in "${WF_ARRAY[@]}"; do
     func_name="models_${wf_id}"
     if type "$func_name" &>/dev/null; then
         "$func_name"
+        # Wait for parallel downloads in this workflow to finish before next
+        dl_wait_all
     else
         warn "Unknown workflow: $wf_id (no function $func_name)"
     fi
 done
+
+# Bail out if any model failed — bot reads exit code to know pod is broken
+# Without this, install.sh exits 0 even with DL_FAIL>0, bot marks ready,
+# user sees red nodes in ComfyUI. See feedback_install_sh_silent_fail.md.
+if [ "$DRY_RUN" = "0" ] && [ "$DL_FAIL" -gt 0 ]; then
+    err "Install aborted: $DL_FAIL downloads failed (OK=$DL_OK SKIP=$DL_SKIP). Pod NOT ready."
+    exit 43
+fi
 
 # ══════════════════════════════════════
 # STEP 4: Post-install (skip in dry-run)
