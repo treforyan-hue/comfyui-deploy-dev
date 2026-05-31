@@ -136,7 +136,7 @@ install_all_nodes() {
 # All patches idempotent — safe to re-run.
 # ══════════════════════════════════════════════════════════════
 apply_runtime_patches() {
-    section "Runtime patches (transformers 5.x compat + virtual nodes filter + rgthree pin)"
+    section "Runtime patches (transformers 5.x compat + virtual nodes filter + rgthree pin + Qwen3VL/BodyRatio/NAG)"
 
     local PATCH_OK=0 PATCH_FAIL=0
 
@@ -274,6 +274,119 @@ sys.exit(1)
                 warn "rgthree-comfy: git checkout failed"
                 PATCH_FAIL=$((PATCH_FAIL+1))
             fi
+        fi
+    fi
+
+    # Patch 6: zhihui Qwen3VL (x_mode) — torch_dtype + BitsAndBytes off (BnB → libnvJitLink.so.13 crash; dtype= не поддерживается Qwen3VL)
+    local QWEN_PY="$CNODES/zhihui_nodes_comfyui/Nodes/Qwen3VL/Qwen3VLBasic.py"
+    if [ -f "$QWEN_PY" ]; then
+        if grep -q "quantization_config=None," "$QWEN_PY"; then
+            log "Qwen3VL Basic: already patched"
+            PATCH_OK=$((PATCH_OK+1))
+        else
+            python3 -c "
+path = '$QWEN_PY'
+with open(path) as f: c = f.read()
+c2 = c.replace('dtype=torch.bfloat16 if self.bf16_support else torch.float16,',
+               'torch_dtype=torch.bfloat16 if self.bf16_support else torch.float16,')
+c2 = c2.replace('quantization_config=quantization_config,', 'quantization_config=None,')
+import sys
+if c2 != c:
+    with open(path, 'w') as f: f.write(c2)
+    sys.exit(0)
+sys.exit(1)
+" && { log "Qwen3VL Basic: applied (torch_dtype + BnB off)"; PATCH_OK=$((PATCH_OK+1)); } \
+  || { warn "Qwen3VL Basic: patterns not found"; PATCH_FAIL=$((PATCH_FAIL+1)); }
+        fi
+        # Config (статичный — путь LLM фиксирован)
+        local QWEN_CFG="$CNODES/zhihui_nodes_comfyui/Nodes/Qwen3VL/qwen3vl_config.json"
+        if [ ! -f "$QWEN_CFG" ]; then
+            cat > "$QWEN_CFG" <<'QCFG'
+{
+  "cache_dir": "/workspace/ComfyUI/models/LLM",
+  "active_model_path": "/workspace/ComfyUI/models/LLM/Qwen3-VL-4B-Instruct",
+  "active_model_name": "Qwen/Qwen3-VL-4B-Instruct",
+  "use_default_cache": false,
+  "provider": "huggingface"
+}
+QCFG
+            log "Qwen3VL config: written"
+        fi
+    fi
+
+    # Patch 7: BodyRatioMapper (action_transfer) — апстрим __init__ не подключает body_ratio_mapper-сабмодуль → SDPose render/proportion/bone ноды отсутствуют
+    local BRM_INIT="$CNODES/ComfyUI-BodyRatioMapper/__init__.py"
+    if [ -f "$BRM_INIT" ]; then
+        if grep -q "BodyRatioMapperSDPoseRender" "$BRM_INIT"; then
+            log "BodyRatioMapper __init__: already patched"
+            PATCH_OK=$((PATCH_OK+1))
+        else
+            cat > "$BRM_INIT" <<'BRMEOF'
+from .nodes import NODE_CLASS_MAPPINGS as _MAIN_NCM
+from .nodes import NODE_DISPLAY_NAME_MAPPINGS as _MAIN_DNM
+from .body_ratio_mapper.render_nodes import BodyRatioMapperSDPoseRender
+from .body_ratio_mapper.proportion_transfer_node import BodyRatioMapperProportionTransfer
+from .body_ratio_mapper.bone_scale_node import BodyRatioMapperSDPoseBoneScale, BodyRatioMapperSDPoseTranslate
+NODE_CLASS_MAPPINGS = {**_MAIN_NCM,
+    "BodyRatioMapperSDPoseRender": BodyRatioMapperSDPoseRender,
+    "BodyRatioMapperProportionTransfer": BodyRatioMapperProportionTransfer,
+    "BodyRatioMapperSDPoseBoneScale": BodyRatioMapperSDPoseBoneScale,
+    "BodyRatioMapperSDPoseTranslate": BodyRatioMapperSDPoseTranslate}
+NODE_DISPLAY_NAME_MAPPINGS = dict(_MAIN_DNM)
+WEB_DIRECTORY = "./web"
+BRMEOF
+            log "BodyRatioMapper __init__: applied"
+            PATCH_OK=$((PATCH_OK+1))
+        fi
+    fi
+
+    # Patch 8: NAG samplers.py — отключить сломанный .chroma.model импорт (NAG-chroma не грузится на текущем comfy; ни один baked-флоу NAG не юзает, патч держит ноду импортируемой)
+    local NAG_S="$CNODES/ComfyUI-NAG/samplers.py"
+    if [ -f "$NAG_S" ]; then
+        if grep -q "^NAGChromaSwitch = None" "$NAG_S"; then
+            log "NAG chroma-off: already patched"
+            PATCH_OK=$((PATCH_OK+1))
+        else
+            python3 -c "
+path = '$NAG_S'
+with open(path) as f: c = f.read()
+c2 = c.replace('from .chroma.model import NAGChromaSwitch', 'NAGChromaSwitch = None')
+c2 = c2.replace('elif model_type == Chroma:', 'elif False:')
+import sys
+if c2 != c:
+    with open(path, 'w') as f: f.write(c2)
+    sys.exit(0)
+sys.exit(1)
+" && { log "NAG chroma-off: applied"; PATCH_OK=$((PATCH_OK+1)); } \
+  || { warn "NAG chroma-off: patterns not found"; PATCH_FAIL=$((PATCH_FAIL+1)); }
+        fi
+    fi
+
+    # Patch 9: папка "detection" (регистрит WanAnimatePreprocess) на новом comfy bb560036 НЕ
+    # включает .onnx в допустимые ext → OnnxDetectionModelLoader не видит vitpose/yolo .onnx
+    # (на диске есть) → красная нода в action_transfer. Дописываем .onnx + чистим filename-кэш
+    # В КОНЦЕ модуля (после всех ре-регистраций — патч сразу после строки регистрации
+    # перетирается последующими импортами; END-блок работает, проверено эмпирически).
+    local WAP="$CNODES/ComfyUI-WanAnimatePreprocess/nodes.py"
+    if [ -f "$WAP" ]; then
+        if grep -q "PATCH detection onnx END" "$WAP"; then
+            log "WanAnimatePreprocess detection .onnx: already patched"
+            PATCH_OK=$((PATCH_OK+1))
+        else
+            cat >> "$WAP" <<'WAPEOF'
+
+# PATCH detection onnx END
+try:
+    _e = folder_paths.folder_names_and_paths.get("detection")
+    if _e:
+        folder_paths.folder_names_and_paths["detection"] = (_e[0], set(_e[1]) | {".onnx"})
+        try: folder_paths.filename_list_cache.pop("detection", None)
+        except Exception: pass
+except Exception:
+    pass
+WAPEOF
+            log "WanAnimatePreprocess detection .onnx: applied"
+            PATCH_OK=$((PATCH_OK+1))
         fi
     fi
 

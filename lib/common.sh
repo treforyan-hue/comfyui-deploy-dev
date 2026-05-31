@@ -180,14 +180,21 @@ _dl_worker() {
 
     if _fast_dl "$url" "$dest" "$header"; then
         local actual; actual=$(stat -c%s "$dest" 2>/dev/null || echo 0)
-        # Size verification — if HF gave us a number, file must match exactly
-        if [ "$expected" -gt 0 ] && [ "$actual" != "$expected" ]; then
+        # Size verification — if HF gave us a number, file must match EXACTLY.
+        # Match = OK at ANY size (diffusers-папки имеют валидные конфиги <1KB,
+        # напр. FishAudio quantization_info.json = 985 B — раньше падало по >1000).
+        if [ "$expected" -gt 0 ]; then
+            if [ "$actual" = "$expected" ]; then
+                log "OK: $name ($actual bytes, size verified)"
+                echo "OK $name $actual" > "$result"
+                return 0
+            fi
             err "FAIL: $name — size mismatch ($actual vs expected $expected)"
             rm -f "$dest" "$dest.aria2" 2>/dev/null
             echo "FAIL $name size_mismatch actual=$actual expected=$expected" > "$result"
             return 1
         fi
-        # Generic sanity check if HF size was unknown
+        # HF размер неизвестен → старая эвристика >1000 байт
         if [ "$actual" -gt 1000 ]; then
             log "OK: $name ($actual bytes)"
             echo "OK $name $actual" > "$result"
@@ -344,6 +351,7 @@ make_link() {
     # Only create symlink if target is a real file (not another symlink to us)
     if [ -f "$target" ] && [ ! -L "$target" -o -e "$target" ]; then
         if [ ! -f "$link" ] || [ -L "$link" ]; then
+            mkdir -p "$(dirname "$link")"   # линк может вести в несуществующую подпапку (напр. diffusion_models/MelBandRoformer/)
             ln -sf "$target" "$link"
             log "Symlink: $(basename "$link") -> $(basename "$target")"
         fi

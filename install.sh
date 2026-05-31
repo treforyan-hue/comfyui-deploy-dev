@@ -141,12 +141,40 @@ if [ "$DRY_RUN" = "0" ]; then
         log "ComfyUI already installed"
     fi
 
+    # Гарантия версии ComfyUI = пин (образ её и так печёт; это idempotent-страховка
+    # на случай дрейфа / старого baked-comfy). bb560036 (30.05) = LTX-2.3 audio VAE +
+    # ResizeImageMaskNode V3-схема. На корректном поде = быстрый no-op (1 rev-parse).
+    COMFY_PIN="bb560036"
+    if [ -d "$COMFY/.git" ]; then
+        CUR=$(git -C "$COMFY" rev-parse --short=8 HEAD 2>/dev/null || echo none)
+        case "$CUR" in
+            ${COMFY_PIN}*) log "ComfyUI at pin ($CUR)" ;;
+            *)
+                log "ComfyUI: $CUR -> pin $COMFY_PIN"
+                git -C "$COMFY" fetch --quiet origin 2>/dev/null || true
+                # -f: server.py патчится в STEP 2.5 (apply_runtime_patches Patch 1) → working tree
+                # «грязный» → без -f checkout прерывается. Патч переприменяется, потеря безопасна.
+                if git -C "$COMFY" checkout --quiet -f "$COMFY_PIN" 2>/dev/null; then
+                    pip install --break-system-packages -q -r "$COMFY/requirements.txt" 2>/dev/null || true
+                    log "ComfyUI pinned to $COMFY_PIN"
+                else
+                    warn "ComfyUI: checkout $COMFY_PIN failed (offline?), keeping $CUR"
+                fi ;;
+        esac
+    fi
+
     python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
         warn "PyTorch/CUDA not detected — Docker image should have it, skipping reinstall"
     }
 
-    mkdir -p "$MODELS"/{diffusion_models,unet,vae,text_encoders,clip,clip_vision,loras,checkpoints}
-    mkdir -p "$MODELS"/{upscale_models,detection,sam2,sams,rife,controlnet,model_patches,seedvr2}
+    # ПОЛНЫЙ набор папок: на новом comfy (bb560036) get_filename_list() на
+    # несуществующей папке бросает FileNotFoundError → нода вылетает из object_info
+    # (красная). На старом comfy отсутствие было безобидно. Создаём всё, что
+    # запрашивают ноды (список собран эмпирически из comfyui.log на поде).
+    mkdir -p "$MODELS"/{diffusion_models,unet,vae,vae_approx,text_encoders,clip,clip_vision,clip_gguf,loras,checkpoints}
+    mkdir -p "$MODELS"/{upscale_models,latent_upscale_models,detection,sam2,sam3,sams,rife,controlnet,model_patches,seedvr2}
+    mkdir -p "$MODELS"/{luts,yolo,onnx,embeddings,style_models,photomaker,gligen,hypernetworks,configs,prompt_generator}
+    mkdir -p "$MODELS"/{audio_encoders,background_removal,frame_interpolation,geometry_estimation,optical_flow}
     mkdir -p "$MODELS"/ultralytics/{bbox,segm}
     mkdir -p "$COMFY/user/default/workflows"
 fi
@@ -231,22 +259,40 @@ fi
 if [ "$DRY_RUN" = "0" ]; then
     section "Starting ComfyUI"
 
-    pkill -f "python.*main.py" 2>/dev/null || true
-    sleep 2
-
-    cd "$COMFY"
-    nohup python3 main.py --listen 0.0.0.0 --port 8188 > /workspace/comfyui.log 2>&1 &
-    CPID=$!
-
-    log "PID: $CPID — waiting for startup (max 5 min)..."
-
-    READY=0
-    for i in $(seq 1 60); do
-        if curl -s http://localhost:8188/system_stats > /dev/null 2>&1; then
-            READY=1
+    # CUDA-гейт: ждём готовности GPU ДО старта (лечит boot-гонку CUDA на свежем поде,
+    # из-за которой ComfyUI падал на старте — а ретрая не было).
+    log "Waiting for CUDA to be ready..."
+    for i in $(seq 1 30); do
+        if python3 -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+            log "CUDA ready after $((i * 4))s"
             break
         fi
-        sleep 5
+        sleep 4
+    done
+
+    # Старт с РЕТРАЕМ: если процесс умер/не поднялся за 5 мин — перезапуск (до 3 попыток).
+    READY=0
+    for attempt in 1 2 3; do
+        pkill -f "python.*main.py" 2>/dev/null || true
+        sleep 2
+        cd "$COMFY"
+        nohup python3 main.py --listen 0.0.0.0 --port 8188 > /workspace/comfyui.log 2>&1 &
+        CPID=$!
+        log "Start attempt $attempt — PID $CPID, waiting up to 5 min..."
+        for i in $(seq 1 60); do
+            if ! kill -0 "$CPID" 2>/dev/null; then
+                warn "ComfyUI process died on attempt $attempt"
+                break
+            fi
+            if curl -s http://localhost:8188/system_stats > /dev/null 2>&1; then
+                READY=1
+                break
+            fi
+            sleep 5
+        done
+        [ "$READY" = "1" ] && break
+        warn "Attempt $attempt failed — last log lines:"
+        tail -12 /workspace/comfyui.log 2>/dev/null
     done
 
     if [ "$READY" = "1" ]; then
