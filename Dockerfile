@@ -131,7 +131,7 @@ RUN git clone https://github.com/ClownsharkBatwing/RES4LYF $CNODES/RES4LYF && cd
 RUN git clone https://github.com/ChangeTheConstants/SeedVarianceEnhancer $CNODES/SeedVarianceEnhancer && cd $CNODES/SeedVarianceEnhancer && git checkout aa97baee8bacbe0dd702e419eb6c39505b631cc3
 RUN git clone https://github.com/giriss/comfy-image-saver $CNODES/comfy-image-saver && cd $CNODES/comfy-image-saver && git checkout 65e6903eff274a50f8b5cd768f0f96baf37baea1
 RUN git clone https://github.com/melMass/comfy_mtb $CNODES/comfy_mtb && cd $CNODES/comfy_mtb && git checkout b705a177d3ae93a969068f3ba156f3bc6fbc8a1d
-RUN git clone https://github.com/Artificial-Sweetener/comfyui-WhiteRabbit $CNODES/comfyui-WhiteRabbit && cd $CNODES/comfyui-WhiteRabbit && git checkout 178156241b29b7cf0fb540a9688e1d9c375e8608
+RUN git clone https://github.com/Artificial-Sweetener/comfyui-WhiteRabbit $CNODES/comfyui-WhiteRabbit && cd $CNODES/comfyui-WhiteRabbit && git checkout 607de1b4679b88a09932c1768db633450ace56b9
 RUN git clone https://github.com/theUpsider/ComfyUI-Logic $CNODES/comfyui-logic && cd $CNODES/comfyui-logic && git checkout 214cfba933291be224156d37bc30c25742076b44
 RUN git clone https://github.com/digitaljohn/comfyui-propost $CNODES/comfyui-propost && cd $CNODES/comfyui-propost && git checkout df6a6d122498f57ad7195d58e07701a501c9dcb6
 RUN git clone https://github.com/teskor-hub/comfyui-teskors-utils $CNODES/comfyui-teskors-utils && cd $CNODES/comfyui-teskors-utils && git checkout c4a8cd1b6f8b724b055cbe371d6192e42babe103
