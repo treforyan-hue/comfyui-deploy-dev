@@ -123,6 +123,13 @@ RUN pip install --break-system-packages --no-cache-dir -q \
 RUN pip install --break-system-packages --no-cache-dir \
     transformers==5.8.1 tokenizers==0.22.2 numpy==2.4.4
 
+# kornia: нода ComfyUI-LTXVideo импортит `kornia.geometry.transform.pyramid.pad`,
+# который УБРАЛИ в kornia 0.8.3 (их issue #494) → ComfyUI-LTXVideo IMPORT FAILED →
+# все LTXV-ноды красные (action_dual и др. LTX-2.3 флоу). Её requirements.txt не
+# пинит kornia → цикл выше (стр. 102) тянет latest 0.8.3. Пинуем последнюю с `pad`.
+# Проверено вживую на дев-поде 01.06: 4962 ноды, LTXVideo грузится, ноды зелёные.
+RUN pip install --break-system-packages --no-cache-dir "kornia==0.8.2"
+
 # ══════════════════════════════════════════════════════════════
 # PATCHES — fix incompatibilities between nodes
 # ══════════════════════════════════════════════════════════════
