@@ -191,6 +191,33 @@ apply_runtime_patches
 
 
 # ══════════════════════════════════════
+# STEP 2.7: Pre-flight CUDA gate (ДО скачки моделей)
+# ══════════════════════════════════════
+# Раньше CUDA проверялась только на STEP 5 (старт ComfyUI) — ПОСЛЕ скачки 62 ГБ.
+# Если у хоста битый GPU (cuInit падает "unknown error", при этом nvidia-smi
+# работает — наблюдалось на Vast RTX PRO 6000 Blackwell), мы зря качали 62 ГБ и
+# крутили 3 ретрая ComfyUI ~17 мин. Теперь ловим мёртвый GPU ЗДЕСЬ за ~60с и
+# аборт ДО скачки. Бот читает маркер CUDA_DEAD → помечает хост битым (#5).
+if [ "$DRY_RUN" = "0" ]; then
+    log "Pre-flight: проверяю CUDA до скачки моделей..."
+    PF_CUDA_OK=0
+    for i in $(seq 1 15); do   # до ~60с на boot-гонку CUDA
+        if python3 -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+            PF_CUDA_OK=1
+            log "Pre-flight CUDA OK after $((i * 4))s"
+            break
+        fi
+        sleep 4
+    done
+    if [ "$PF_CUDA_OK" = "0" ]; then
+        err "=== CUDA_DEAD ==="
+        err "GPU на этом хосте не инициализирует CUDA (cuInit fail; nvidia-smi может работать)."
+        err "Битый хост — НЕ качаю модели (экономлю 62 ГБ и 15 мин). Пересоздай под — попадёшь на другой хост."
+        exit 44
+    fi
+fi
+
+# ══════════════════════════════════════
 # STEP 3: Models (per workflow)
 # ══════════════════════════════════════
 section "Model downloads"
