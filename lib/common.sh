@@ -91,7 +91,47 @@ _ensure_aria2() {
     fi
 }
 
-# ── Fast download with aria2c (16 connections), curl fallback ──
+# Records which method actually fetched the last file: "hf" | "aria2c" | "curl".
+# Set by _fast_dl, read by _dl_worker to decide whether a size gate is needed.
+_LAST_DL_METHOD=""
+
+# ── HuggingFace CLI download (Xet-proof, PRIMARY method, added 2026-07-03) ──
+# `hf download` streams through HuggingFace's own client which:
+#   • goes around the aria2c multi-connection Xet-403 storm entirely
+#   • resumes + integrity-checks internally (etag/sha) → file is never partial
+# Only handles HF resolve URLs; returns 1 (→ caller falls back to aria2c) for
+# any non-HF URL or if the `hf` CLI is missing. Never deletes the caller's dest.
+_hf_cli_dl() {
+    local url="$1" dest="$2"
+    command -v hf >/dev/null 2>&1 || return 1
+    case "$url" in
+        *huggingface.co/*/resolve/*) ;;
+        *) return 1 ;;
+    esac
+    # https://huggingface.co/<repo>/resolve/<rev>/<path>?<query>
+    local rest="${url#*huggingface.co/}"     # <repo>/resolve/<rev>/<path>?<q>
+    local repo="${rest%%/resolve/*}"         # <owner>/<name>
+    local tail="${rest#*/resolve/}"          # <rev>/<path>?<q>
+    local rev="${tail%%/*}"                  # <rev>
+    local path="${tail#*/}"                  # <path>?<q>
+    path="${path%%\?*}"                       # strip ?query
+    [ -z "$repo" ] && return 1
+    [ -z "$path" ] && return 1
+    local tmp; tmp="$(dirname "$dest")/.hfdl.$BASHPID.$RANDOM"
+    rm -rf "$tmp" 2>/dev/null; mkdir -p "$tmp" || return 1
+    local tok=(); [ -n "${HF_TOKEN:-}" ] && tok=(--token "$HF_TOKEN")
+    if HF_HUB_ENABLE_HF_TRANSFER=0 hf download "$repo" "$path" --revision "$rev" \
+            --local-dir "$tmp" "${tok[@]}" >/dev/null 2>&1 && [ -f "$tmp/$path" ]; then
+        mkdir -p "$(dirname "$dest")"
+        mv -f "$tmp/$path" "$dest"
+        rm -rf "$tmp" 2>/dev/null
+        return 0
+    fi
+    rm -rf "$tmp" 2>/dev/null
+    return 1
+}
+
+# ── Fast download: hf download (primary) → aria2c → curl (fallbacks) ──
 # aria2c returns exit 0 even on errors and may download HTML error pages.
 # Always verify file size after download. Fallback to curl on failure.
 #
@@ -106,11 +146,18 @@ _ensure_aria2() {
 # (aria2 issue #441 + production config from copyprogramming.com 2026 guide).
 _fast_dl() {
     local url="$1" dest="$2" header="${3:-}"
+    _LAST_DL_METHOD=""
 
     # Remove broken symlinks before download
     [ -L "$dest" ] && [ ! -e "$dest" ] && rm -f "$dest"
 
-    # Try aria2c first (fast, 16 connections)
+    # ── Method 1: hf download (Xet-proof); silently falls through for non-HF URLs ──
+    if _hf_cli_dl "$url" "$dest"; then
+        _LAST_DL_METHOD="hf"
+        return 0
+    fi
+
+    # Try aria2c next (fast, 16 connections)
     if command -v aria2c &>/dev/null; then
         local aria_args=(
             -x16 -s16 -k5M --min-split-size=5M
@@ -130,6 +177,7 @@ _fast_dl() {
         aria2c "${aria_args[@]}" "$url" 2>&1
         # Verify: aria2c returns 0 even on error, check file size
         if [ -f "$dest" ] && [ "$(stat -c%s "$dest" 2>/dev/null || echo 0)" -gt 100000 ]; then
+            _LAST_DL_METHOD="aria2c"
             return 0
         fi
         # aria2c failed or downloaded junk — remove and try curl
@@ -139,6 +187,7 @@ _fast_dl() {
 
     # Fallback to curl with resume (-C -) and retry
     local curl_args=(-L -C - --progress-bar --max-time 1800 --retry 5 --retry-delay 10 --retry-max-time 600)
+    _LAST_DL_METHOD="curl"
     if [ -n "$header" ]; then
         curl "${curl_args[@]}" -H "$header" "$url" -o "$dest" 2>&1
     else
@@ -175,33 +224,42 @@ _dl_worker() {
 
     mkdir -p "$(dirname "$dest")"
 
-    # Get expected size BEFORE download — needed for verification
-    local expected; expected=$(_hf_get_size "$url" "$header")
-
     if _fast_dl "$url" "$dest" "$header"; then
         local actual; actual=$(stat -c%s "$dest" 2>/dev/null || echo 0)
-        # Size verification — if HF gave us a number, file must match EXACTLY.
-        # Match = OK at ANY size (diffusers-папки имеют валидные конфиги <1KB,
-        # напр. FishAudio quantization_info.json = 985 B — раньше падало по >1000).
-        if [ "$expected" -gt 0 ]; then
-            if [ "$actual" = "$expected" ]; then
-                log "OK: $name ($actual bytes, size verified)"
-                echo "OK $name $actual" > "$result"
-                return 0
-            fi
-            err "FAIL: $name — size mismatch ($actual vs expected $expected)"
-            rm -f "$dest" "$dest.aria2" 2>/dev/null
-            echo "FAIL $name size_mismatch actual=$actual expected=$expected" > "$result"
-            return 1
+
+        # ── hf download path: HF client already verified integrity (etag/sha) ──
+        # Trust it, no size gate. hf never leaves a partial file on success.
+        if [ "$_LAST_DL_METHOD" = "hf" ]; then
+            log "OK: $name ($actual bytes, hf verified)"
+            echo "OK $name $actual" > "$result"
+            return 0
         fi
-        # HF размер неизвестен → старая эвристика >1000 байт
+
+        # ── fallback path (aria2c/curl): soft size check, NEVER delete/hard-fail ──
+        # We only get here if hf download failed first (rare). A size mismatch here
+        # means the fallback fetched something odd — we KEEP the file and let the pod
+        # come up (ComfyUI will surface a per-node error) instead of rm+exit-43 which
+        # used to nuke good files on 307/linked HF repos that hide X-Linked-Size.
+        local expected; expected=$(_hf_get_size "$url" "$header")
+        if [ "$expected" -gt 0 ] && [ "$actual" = "$expected" ]; then
+            log "OK: $name ($actual bytes, size verified via $_LAST_DL_METHOD)"
+            echo "OK $name $actual" > "$result"
+            return 0
+        fi
+        if [ "$expected" -gt 0 ] && [ "$actual" != "$expected" ]; then
+            warn "SIZE MISMATCH (kept, via $_LAST_DL_METHOD): $name — $actual vs expected $expected"
+            echo "OK $name $actual size_warn" > "$result"
+            return 0
+        fi
+        # HF size unknown → legacy >1000-byte heuristic (small non-LFS JSON etc.)
         if [ "$actual" -gt 1000 ]; then
-            log "OK: $name ($actual bytes)"
+            log "OK: $name ($actual bytes, via $_LAST_DL_METHOD)"
             echo "OK $name $actual" > "$result"
             return 0
         fi
     fi
-    err "FAIL: $name (download failed)"
+    # Nothing downloaded anything usable at all → real failure (pod not ready).
+    err "FAIL: $name (all methods failed)"
     rm -f "$dest" "$dest.aria2" 2>/dev/null
     echo "FAIL $name download_failed" > "$result"
     return 1
