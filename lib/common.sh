@@ -117,17 +117,64 @@ _hf_cli_dl() {
     path="${path%%\?*}"                       # strip ?query
     [ -z "$repo" ] && return 1
     [ -z "$path" ] && return 1
-    local tmp; tmp="$(dirname "$dest")/.hfdl.$BASHPID.$RANDOM"
-    rm -rf "$tmp" 2>/dev/null; mkdir -p "$tmp" || return 1
-    local tok=(); [ -n "${HF_TOKEN:-}" ] && tok=(--token "$HF_TOKEN")
-    if HF_HUB_ENABLE_HF_TRANSFER=0 hf download "$repo" "$path" --revision "$rev" \
-            --local-dir "$tmp" "${tok[@]}" >/dev/null 2>&1 && [ -f "$tmp/$path" ]; then
-        mkdir -p "$(dirname "$dest")"
-        mv -f "$tmp/$path" "$dest"
+    # ── Stall-watchdog wrapper (2026-07-06) ─────────────────────────────
+    # `hf download` has no data-plane stall timeout: a silently dropped TCP
+    # to the xet bridge hangs it forever (xet-core#795/#869) and the cascade
+    # never falls through to aria2c. So: run hf in its own process group and
+    # watch ACTIVITY inside $tmp — classic path grows *.incomplete there,
+    # xet path writes a JSON progress log there (HF_XET_LOG_DEST, ~200ms
+    # cadence while bytes flow). No activity for STALL_LIMIT → kill → one
+    # retry (xet chunks persist in HF_XET_CACHE → cheap block-level resume)
+    # → give up → caller falls back to aria2c/curl. HARD_CAP guards against
+    # pathological retry-loops that keep logging without progress.
+    # Token: hf reads HF_TOKEN from env — no --token in argv (leaks in ps).
+    local attempt tick=5 stall_limit=300
+    for attempt in 1 2; do
+        local tmp; tmp="$(dirname "$dest")/.hfdl.$BASHPID.$RANDOM"
+        rm -rf "$tmp" 2>/dev/null; mkdir -p "$tmp" || return 1
+        local hard_cap=5400
+        [ "$attempt" = "2" ] && hard_cap=1800
+
+        setsid env \
+            HF_XET_LOG_DEST="$tmp/.xetlog" \
+            HF_XET_LOG_FORMAT=json \
+            HF_XET_CACHE=/workspace/.xet-cache \
+            HF_XET_CHUNK_CACHE_SIZE_BYTES=20000000000 \
+            HF_XET_CLIENT_READ_TIMEOUT=60 \
+            HF_XET_CLIENT_RETRY_MAX_ATTEMPTS=5 \
+            hf download "$repo" "$path" --revision "$rev" \
+                --local-dir "$tmp" >/dev/null 2>&1 &
+        local hfpid=$!
+
+        local last="-1" size="" stall=0 waited=0 killed=0
+        while kill -0 "$hfpid" 2>/dev/null; do
+            sleep "$tick"
+            waited=$((waited + tick))
+            size=$(du -sb "$tmp" 2>/dev/null | awk '{print $1}')
+            if [ "${size:-0}" = "$last" ]; then
+                stall=$((stall + tick))
+            else
+                stall=0; last="${size:-0}"
+            fi
+            if [ "$stall" -ge "$stall_limit" ] || [ "$waited" -ge "$hard_cap" ]; then
+                warn "hf STALLED: $(basename "$dest") (${stall}s idle, ${waited}s total, attempt $attempt/2) — killing"
+                kill -TERM -- "-$hfpid" 2>/dev/null; kill -TERM "$hfpid" 2>/dev/null
+                sleep 3
+                kill -KILL -- "-$hfpid" 2>/dev/null; kill -KILL "$hfpid" 2>/dev/null
+                killed=1
+                break
+            fi
+        done
+        local rc=1
+        wait "$hfpid" 2>/dev/null; rc=$?
+        if [ "$killed" = "0" ] && [ "$rc" = "0" ] && [ -f "$tmp/$path" ]; then
+            mkdir -p "$(dirname "$dest")"
+            mv -f "$tmp/$path" "$dest"
+            rm -rf "$tmp" 2>/dev/null
+            return 0
+        fi
         rm -rf "$tmp" 2>/dev/null
-        return 0
-    fi
-    rm -rf "$tmp" 2>/dev/null
+    done
     return 1
 }
 
@@ -272,7 +319,10 @@ _dl_worker() {
 dl_hf() {
     local url="$1" dest="$2"
     local name; name=$(basename "$dest")
-    local auth="Authorization: Bearer ${HF_TOKEN:-}"
+    # Auth header ONLY when a real token is present — an empty "Bearer " is a
+    # malformed credential and can turn public files into 401s on fallbacks.
+    local auth=""
+    [ -n "${HF_TOKEN:-}" ] && auth="Authorization: Bearer $HF_TOKEN"
     local result="$DL_RESULT_DIR/skip_$$_$RANDOM.result"
 
     if [ "$DRY_RUN" = "1" ]; then
