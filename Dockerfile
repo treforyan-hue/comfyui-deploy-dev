@@ -130,6 +130,15 @@ RUN pip install --break-system-packages --no-cache-dir \
 # Проверено вживую на дев-поде 01.06: 4962 ноды, LTXVideo грузится, ноды зелёные.
 RUN pip install --break-system-packages --no-cache-dir "kornia==0.8.2"
 
+# ── ORT-GPU invariant (2026-07-19): нодовые requirements затирают
+# onnxruntime-gpu CPU-пакетом, а cu13-билд не создаёт CUDA-сессию на этом
+# образе (libnvrtc.so.13 вне путей; системный toolkit = CUDA 12.8) →
+# DWPose/insightface/nudenet молча на CPU: vitpose 994мс/кадр vs 7.1мс GPU
+# (x140, живой замер). Пин cu12-1.22 (линкуется на системный toolkit) + шим
+# от повторного затирания. Строгий: провал = красный CI, тег не выходит.
+COPY lib/ort_gpu_fix.sh /tmp/ort_gpu_fix.sh
+RUN bash /tmp/ort_gpu_fix.sh
+
 # ══════════════════════════════════════════════════════════════
 # PATCHES — fix incompatibilities between nodes
 # ══════════════════════════════════════════════════════════════

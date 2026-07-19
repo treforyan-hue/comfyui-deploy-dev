@@ -281,6 +281,44 @@ if [ "$DRY_RUN" = "0" ]; then
 fi
 
 # ══════════════════════════════════════
+# STEP 3.7: ORT-GPU guard (2026-07-19)
+# ══════════════════════════════════════
+# Ноды могли затереть onnxruntime-gpu CPU-пакетом (класс: рантайм-доклон
+# clone_node / ручной pip на поде). Проверка ЧЕСТНАЯ — реальная CUDA-сессия
+# на скачанном .onnx: список providers ВРЁТ при недогруженных либах.
+# Лечение = lib/ort_gpu_fix.sh (пин cu12-1.22 + шим от повторного затирания).
+# НИКОГДА не роняет установку: провал = onnx-стадии на CPU (медленно, но
+# работает). ComfyUI стартует ПОСЛЕ (STEP 5 всегда pkill+start) → вылеченный
+# пакет подхватывается без дополнительного рестарта.
+if [ "$DRY_RUN" = "0" ]; then
+    section "ORT-GPU guard"
+    # GPU мог ещё бутиться (гонка свежего пода) — короткое ожидание, иначе
+    # сессия-проба даст ложный провал и бесполезное (но безвредное) лечение.
+    for _i in $(seq 1 15); do
+        python3 -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null && break
+        sleep 4
+    done
+    ORT_PROBE=$(find "$MODELS" -maxdepth 3 -name '*.onnx' -size +1M -printf '%s %p\n' 2>/dev/null | sort -n | head -1 | cut -d' ' -f2-)
+    _ort_ok() {
+        if [ -n "$ORT_PROBE" ]; then
+            python3 -c "import onnxruntime as o,sys;s=o.InferenceSession('$ORT_PROBE',providers=['CUDAExecutionProvider','CPUExecutionProvider']);sys.exit(0 if 'CUDAExecutionProvider' in s.get_providers() else 1)" >/dev/null 2>&1
+        else
+            python3 -c "import onnxruntime as o,sys;sys.exit(0 if 'CUDAExecutionProvider' in o.get_available_providers() else 1)" >/dev/null 2>&1
+        fi
+    }
+    if _ort_ok; then
+        log "OFM_ORT_CUDA_OK${ORT_PROBE:+ (session: $(basename "$ORT_PROBE"))}"
+    else
+        warn "onnxruntime без CUDA EP — лечу (lib/ort_gpu_fix.sh)"
+        if bash "$SCRIPT_DIR/lib/ort_gpu_fix.sh" && _ort_ok; then
+            log "OFM_ORT_CUDA_OK (healed)"
+        else
+            warn "OFM_ORT_CUDA_FAIL — onnx-стадии пойдут на CPU (медленно, но работает)"
+        fi
+    fi
+fi
+
+# ══════════════════════════════════════
 # STEP 5: Start ComfyUI (skip in dry-run)
 # ══════════════════════════════════════
 if [ "$DRY_RUN" = "0" ]; then
